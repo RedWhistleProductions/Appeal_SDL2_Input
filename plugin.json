@@ -1,0 +1,22 @@
+{
+    "schema_version":  1,
+    "name":  "Appeal_SDL2_Input",
+    "version":  "1.0.0-beta.1",
+    "module":  "Input",
+    "platforms":  [
+                      "windows-x64",
+                      "linux-x64"
+                  ],
+    "artifacts":  {
+                      "windows":  "Appeal_SDL2_Input.dll",
+                      "linux":  "Appeal_SDL2_Input.so"
+                  },
+    "runtime_dependencies":  {
+                                 "windows":  [
+                                                 "SDL2.dll"
+                                             ],
+                                 "linux_debian":  [
+                                                      "libsdl2-2.0-0"
+                                                  ]
+                             }
+}
