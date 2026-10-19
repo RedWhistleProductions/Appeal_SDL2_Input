@@ -8,8 +8,11 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -76,7 +79,45 @@ std::set<int> Wanted_Controllers;
 std::vector<std::string> Triggered_Functions;
 void (*Run_Function_Callback)(std::string Function) = nullptr;
 void (*Run_Analog_Function_Callback)(std::string Function, int Value) = nullptr;
-const int Controller_Deadzone = 8000;
+int Controller_Deadzone = 24; // percent of axis travel, adjustable 0..99
+std::map<std::string, bool> Key_Repeat, Mouse_Repeat, Controller_Repeat;
+std::map<int, std::map<std::string, bool>> Controller_Repeat_For;
+std::map<std::string, Uint32> Repeat_Times;
+
+bool Repeat_Due(const std::string &Binding, bool Down, bool Pressed, bool Enabled, Uint32 Now)
+{
+    if(!Down) { Repeat_Times.erase(Binding); return false; }
+    if(Pressed) { Repeat_Times[Binding] = Now; return true; }
+    auto It = Repeat_Times.find(Binding);
+    if(It == Repeat_Times.end()) { Repeat_Times[Binding] = Now; return false; }
+    if(Enabled && static_cast<Uint32>(Now - It->second) >= 100) {
+        It->second = Now;
+        return true;
+    }
+    return false;
+}
+
+int Map_Controller_Axis(int Raw)
+{
+    const double Magnitude = Raw < 0 ? -static_cast<double>(Raw) / 32768.0 : Raw / 32767.0;
+    const double Deadzone = Controller_Deadzone / 100.0;
+    if(Magnitude <= Deadzone) return 0;
+    const int Mapped = std::clamp(static_cast<int>(std::lround((Magnitude - Deadzone) * 100.0 / (1.0 - Deadzone))), 0, 100);
+    return Raw < 0 ? -Mapped : Mapped;
+}
+
+extern "C" bool Set_Controller_Deadzone(int Percent)
+{
+    if(Percent < 0 || Percent > 99) return false;
+    Controller_Deadzone = Percent;
+    return true;
+}
+extern "C" void Set_Key_Repeat(std::string Key, bool Enabled) { Key_Repeat[Key] = Enabled; }
+extern "C" void Set_Mouse_Repeat(std::string Button, bool Enabled) { Mouse_Repeat[Button] = Enabled; }
+extern "C" void Set_Controller_Button_Repeat(std::string Button, bool Enabled) { Controller_Repeat[Button] = Enabled; }
+extern "C" void Set_Controller_Button_Repeat_For(int Controller, std::string Button, bool Enabled) {
+    Controller_Repeat_For[Controller][Button] = Enabled;
+}
 
 int Mouse_X_Value = 0;
 int Mouse_Y_Value = 0;
@@ -179,6 +220,20 @@ SDL_GameControllerAxis Controller_Axis_Code(std::string Axis)
     return SDL_CONTROLLER_AXIS_INVALID;
 }
 
+// Observe events without stealing wheel/controller notifications from Graphics.
+std::mutex Pending_Events_Mutex;
+std::vector<SDL_Event> Pending_Events;
+int SDLCALL Watch_Input_Event(void*, SDL_Event *Event)
+{
+    if(Event->type == SDL_MOUSEWHEEL || Event->type == SDL_CONTROLLERDEVICEADDED ||
+       Event->type == SDL_CONTROLLERDEVICEREMOVED)
+    {
+        std::lock_guard<std::mutex> Lock(Pending_Events_Mutex);
+        Pending_Events.push_back(*Event);
+    }
+    return 1;
+}
+
 bool Ensure_SDL()
 {
     if(SDL_Ready)
@@ -192,6 +247,7 @@ bool Ensure_SDL()
         return false;
     }
 
+    SDL_AddEventWatch(Watch_Input_Event, nullptr);
     SDL_Ready = true;
     return true;
 }
@@ -401,6 +457,14 @@ extern "C" void Constructor()
 
 extern "C" void Destructor()
 {
+    if(SDL_Ready) SDL_DelEventWatch(Watch_Input_Event, nullptr);
+    {
+        std::lock_guard<std::mutex> Lock(Pending_Events_Mutex);
+        Pending_Events.clear();
+    }
+    Repeat_Times.clear();
+    Key_Repeat.clear(); Mouse_Repeat.clear(); Controller_Repeat.clear(); Controller_Repeat_For.clear();
+    Controller_Deadzone = 24;
     Control_Sets.clear();
     Key_Now.clear();
     Key_Before.clear();
@@ -474,9 +538,13 @@ extern "C" void Update(std::string Control_Set_Name)
     Mouse_Wheel_Value = 0;
     Triggered_Functions.clear();
 
-    SDL_Event Event;
-    std::vector<SDL_Event> Unhandled_Events;
-    while(SDL_PollEvent(&Event))
+    SDL_PumpEvents();
+    std::vector<SDL_Event> Events;
+    {
+        std::lock_guard<std::mutex> Lock(Pending_Events_Mutex);
+        Events.swap(Pending_Events);
+    }
+    for(const SDL_Event &Event : Events)
     {
         if(Event.type == SDL_MOUSEWHEEL)
         {
@@ -509,16 +577,6 @@ extern "C" void Update(std::string Control_Set_Name)
                 }
             }
         }
-        else
-        {
-            Unhandled_Events.push_back(Event);
-        }
-    }
-
-    for(const SDL_Event &Unhandled_Event : Unhandled_Events)
-    {
-        SDL_Event Event_Copy = Unhandled_Event;
-        SDL_PushEvent(&Event_Copy);
     }
 
     int New_Mouse_X = 0;
@@ -563,7 +621,7 @@ extern "C" void Update(std::string Control_Set_Name)
 
     for(const auto &Item : Key_Down_Functions)
     {
-        if(Key_Pressed_State(Item.first)) Trigger_Function(Item.second);
+        if(Repeat_Due("Key:" + Item.first, Key_Down_State(Item.first), Key_Pressed_State(Item.first), Key_Repeat[Item.first], SDL_GetTicks())) Trigger_Function(Item.second);
     }
     for(const auto &Item : Key_Up_Functions)
     {
@@ -571,7 +629,7 @@ extern "C" void Update(std::string Control_Set_Name)
     }
     for(const auto &Item : Mouse_Down_Functions)
     {
-        if(Mouse_Pressed_State(Item.first)) Trigger_Function(Item.second);
+        if(Repeat_Due("Mouse:" + Item.first, Mouse_Down_State(Item.first), Mouse_Pressed_State(Item.first), Mouse_Repeat[Item.first], SDL_GetTicks())) Trigger_Function(Item.second);
     }
     for(const auto &Item : Mouse_Up_Functions)
     {
@@ -594,12 +652,12 @@ extern "C" void Update(std::string Control_Set_Name)
 
         for(SDL_GameControllerAxis Axis : Controller_Axes())
         {
-            State.Axis_Now[Axis] = SDL_GameControllerGetAxis(State.Controller, Axis);
+            State.Axis_Now[Axis] = Map_Controller_Axis(SDL_GameControllerGetAxis(State.Controller, Axis));
         }
 
         for(const auto &Item : Controller_Button_Down_Functions)
         {
-            if(Controller_Button_Pressed_State(Controller_Index, Item.first)) Trigger_Function(Item.second);
+            if(Repeat_Due("Controller:" + std::to_string(State.Instance_ID) + ":" + Item.first, Controller_Button_Down_State(Controller_Index, Item.first), Controller_Button_Pressed_State(Controller_Index, Item.first), Controller_Repeat[Item.first], SDL_GetTicks())) Trigger_Function(Item.second);
         }
         for(const auto &Item : Controller_Button_Up_Functions)
         {
@@ -607,7 +665,7 @@ extern "C" void Update(std::string Control_Set_Name)
         }
         for(const auto &Item : Controller_Button_Down_For[Controller_Index])
         {
-            if(Controller_Button_Pressed_State(Controller_Index, Item.first)) Trigger_Function(Item.second);
+            if(Repeat_Due("ControllerFor:" + std::to_string(State.Instance_ID) + ":" + Item.first, Controller_Button_Down_State(Controller_Index, Item.first), Controller_Button_Pressed_State(Controller_Index, Item.first), Controller_Repeat_For[Controller_Index][Item.first], SDL_GetTicks())) Trigger_Function(Item.second);
         }
         for(const auto &Item : Controller_Button_Up_For[Controller_Index])
         {
@@ -621,7 +679,7 @@ extern "C" void Update(std::string Control_Set_Name)
 
             int Value = State.Axis_Now[Axis_Code];
             int Before = State.Axis_Before[Axis_Code];
-            if(std::abs(Value) > Controller_Deadzone || (Value != Before && std::abs(Before) > Controller_Deadzone))
+            if(Value != 0 || Before != 0)
             {
                 Trigger_Analog_Function(Item.second, Value);
             }
@@ -633,7 +691,7 @@ extern "C" void Update(std::string Control_Set_Name)
 
             int Value = State.Axis_Now[Axis_Code];
             int Before = State.Axis_Before[Axis_Code];
-            if(std::abs(Value) > Controller_Deadzone || (Value != Before && std::abs(Before) > Controller_Deadzone))
+            if(Value != 0 || Before != 0)
             {
                 Trigger_Analog_Function(Item.second, Value);
             }
@@ -883,7 +941,7 @@ extern "C" void Open_Controller(int Controller)
 
     for(SDL_GameControllerAxis Axis : Controller_Axes())
     {
-        State.Axis_Now[Axis] = SDL_GameControllerGetAxis(Game_Controller, Axis);
+        State.Axis_Now[Axis] = Map_Controller_Axis(SDL_GameControllerGetAxis(Game_Controller, Axis));
         State.Axis_Before[Axis] = State.Axis_Now[Axis];
     }
 
